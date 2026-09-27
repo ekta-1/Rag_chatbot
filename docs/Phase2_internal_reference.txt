@@ -1,0 +1,513 @@
+================================================================================
+INTERNAL REFERENCE ONLY -- NOT A DELIVERABLE, NOT FOR SUBMISSION.
+Not part of the PRD, architecture, or demo. This is a build log for the team:
+what exists after Phase 2, which file does what, what broke along the way, and
+what is still open.
+================================================================================
+
+
+PHASE 2 -- CHUNKING, EMBEDDING, VECTOR STORE
+Status: COMPLETE and verified
+Verified: 70/70 tests pass | 26 chunks indexed | collection count 26 == manifest
+          chunk_count 26 | failures: 0 | distance space: cosine
+Corpus consumed: 55 blocks / ~10,500 chars (unchanged, from Phase 1)
+Corpus produced: 26 chunks, 47-153 wordpiece tokens, median 87, mean 91.7
+NOTE: Phase 0 and Phase 1 are prerequisites and were already complete. Only
+      what changed or was added in Phase 2 is listed below.
+
+
+--------------------------------------------------------------------------------
+1. DEPENDENCIES ADDED
+--------------------------------------------------------------------------------
+
+Installed into the existing .venv (1.4G total, torch is the bulk):
+
+    chromadb                1.5.9
+    sentence-transformers   6.1.0
+    torch                   2.14.0
+    transformers            5.17.0
+
+  anthropic and streamlit are in requirements.txt but STILL NOT INSTALLED --
+  they are Phase 4 / Phase 6. Do not install them yet; nothing imports them
+  until then and cli.py defers those imports into the handlers.
+
+  Model weights download once to ~/.cache/huggingface (87M) and are then read
+  from disk. First ingest pays a ~20s model load; later ones are fast. A demo on
+  a cold machine should be run once beforehand.
+
+
+--------------------------------------------------------------------------------
+2. THE MODEL CONSTRAINT THAT SET EVERY NUMBER
+--------------------------------------------------------------------------------
+
+    sentence-transformers/all-MiniLM-L6-v2
+      384 dimensions, ~90MB, CPU-viable, English general-purpose (not
+      finance-tuned), and -- the part that matters --
+
+      max_seq_length = 256 wordpiece tokens.
+
+  Verified empirically before any chunking code was written:
+
+      >>> m = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+      >>> m.max_seq_length
+      256
+      >>> m.get_sentence_embedding_dimension()
+      384
+
+  The PRD originally specified 300-600 token chunks. A 600-token chunk is
+  embedded with everything past token 256 SILENTLY DROPPED -- no warning, no
+  error, no exception. Any fact in that tail becomes permanently unretrievable
+  and the bot will confidently answer from a different chunk instead.
+
+  Therefore: target 200, hard cap 240, overlap 25. The cap sits below the model's
+  limit, not near it, leaving room for the two special tokens and the
+  "{scheme_name} -- {section}" prefix. Counts use the HF tokenizer, never
+  len(text.split()).
+
+  This is locked in by a test marked @pytest.mark.integration, because it is
+  the assumption the whole index is built on.
+
+
+--------------------------------------------------------------------------------
+3. src/ingest/chunker.py                        329 lines  (NEW)
+--------------------------------------------------------------------------------
+
+  Heading-aware split with recursive fallback. Confirms PRD open question #1.
+
+  Invariants, each with at least one test:
+    - a chunk belongs to exactly ONE section, never merged across sections
+    - a table row's label and value always stay together
+    - a list item is never bisected
+    - no chunk exceeds chunk_hard_cap_tokens (240)
+    - chunks under min_chunk_tokens (30) are dropped
+    - IDs are deterministic
+    - chunking the same Document twice yields byte-identical IDs
+
+  Key functions:
+    chunk_document()      - main entry
+    _make_atoms()         - flatten blocks into atoms + track char offsets
+    _recursive_split()    - over ["\n\n", "\n", ". ", " ", ""] then hard cut
+    _hard_cut()           - cut on TOKEN IDS, not characters
+    _overlap_tail()       - line-aware tail, falls back to a token slice
+    _pack_section()       - greedy pack to (chunk_size - overlap) budget
+    _token_tail()         - exact last-N-wordpieces slice
+
+  Design notes worth not breaking:
+    - MAX_SPLIT_DEPTH is a real guard. A pathological input with no separators
+      must not spin; it hard-cuts and logs.
+    - The content budget is chunk_size - overlap, NOT chunk_size. Overlap is
+      applied at assembly time, so a chunk can never end up being nothing but
+      overlap. This is why the hard-cap assertion is a raise, not a log: if it
+      ever fires, the two budgets are inconsistent and that is a bug, not a
+      warning to shrug at.
+    - _hard_cut decodes token ids rather than slicing characters, so chunk
+      edges do not produce mojibake.
+    - char_start is the offset into the concatenated block text. It exists for
+      acceptance test A7 -- a human must be able to hand-verify any chunk
+      against the source page without running code.
+
+  Real output for large_cap (5 chunks, one per section):
+
+    idx=0 char_start=0     Fees, exit load and investment limits   61 tok
+    idx=1 char_start=222   Benchmark, risk and scheme profile       83 tok
+    idx=2 char_start=648   Tax implication                          47 tok
+    idx=3 char_start=807   Fund management                         110 tok
+    idx=4 char_start=1268  Overview                                136 tok
+
+
+--------------------------------------------------------------------------------
+4. src/ingest/embedder.py                      119 lines  (NEW)
+--------------------------------------------------------------------------------
+
+    get_embedder()        - module-level singleton, lru_cache'd
+    Embedder.embed_documents(texts)  - batched, normalized, 384-dim
+    Embedder.embed_query(text)       - same model, same normalization
+
+  - Lazy import. Nothing loads the model until ingest or ask actually needs it,
+    so `cli --help` and the test suite stay fast.
+  - ONE instance per process, shared by ingest and query. Two model instances
+    is how a query vector silently ends up in a different space from the index.
+  - Vectors are L2-normalized. This is what makes cosine the right distance and
+    what lets dot product stand in for it.
+  - Asserts 384 dimensions. Cheap, and it fails loudly at index time rather
+    than returning noise at query time.
+
+
+--------------------------------------------------------------------------------
+5. src/ingest/store.py                          290 lines  (NEW)
+--------------------------------------------------------------------------------
+
+  The only module that imports chromadb. All collection names, id schemes and
+  query shapes live here (architecture decision D12) so the store can be
+    swapped for pgvector or FAISS without touching retrieval.
+
+    get_client()           - persistent client at cfg.chroma_dir
+    ensure_collection()    - create or VALIDATE (write path)
+    open_collection()      - get without validation (read path)
+    upsert_chunks()        - deterministic upsert, returns count
+    query()                - nearest neighbours -> Hit list
+    get_chunk()            - fetch by id (verification/debugging)
+    delete_scheme()        - drop every chunk for one scheme
+    count() / reset() / stats()
+    EmbeddingModelMismatch - the guard exception
+
+  THE GUARD. The collection records which model built it. Writing into a
+  collection built with a different model is refused unless --force. A
+  dimension mismatch would otherwise fail silently and every query would return
+  noise, which is the classic way a RAG demo starts looking broken for no
+  visible reason. The error message tells you the exact command to run.
+
+  Read-only helpers (count, stats, get_chunk, delete_scheme) deliberately go
+  through open_collection() and BYPASS the guard, so `cli inspect` still works
+  immediately after an intentional model change -- exactly when you need it.
+
+  delete_scheme() exists because deterministic ids have a sharp edge: if a
+  source stops producing chunks (page redesigned, extraction broken) its OLD
+  chunks survive the upsert and the bot keeps answering from them. The pipeline
+  calls it for any source that produced nothing this run and records
+  stale_chunks_removed in the manifest.
+
+
+--------------------------------------------------------------------------------
+6. THE COSINE BUG -- the most important thing in this phase
+--------------------------------------------------------------------------------
+
+  ChromaDB's default distance space is SQUARED L2, not cosine. store.py
+  converts distances to a score with:
+
+      score = max(0, min(1, 1 - distance))
+
+  which is a cosine similarity ONLY IF the collection was built on the cosine
+  space. On the default L2 space that expression is a meaningless number, and
+  every threshold in Phase 3 would be calibrated against garbage.
+
+  The first Phase 2 build had exactly this bug. It was caught while writing
+  test_collection_uses_cosine_distance, which asserts the collection metadata.
+
+  Fix, three parts:
+    1. created with metadata {"hnsw:space": "cosine", "embed_model": ...}
+    2. ensure_collection() REFUSES to operate on a collection whose
+       hnsw:space is anything else, with an error pointing at --force.
+       Chroma cannot change the index space in place, so this must recreate.
+    3. store.stats() reports distance_space, so `cli inspect` shows it.
+
+  If you ever see a score that looks wrong, check `cli inspect` first. The
+  space is reported there on purpose.
+
+
+--------------------------------------------------------------------------------
+7. src/ingest/pipeline.py                      315 lines  (CHANGED: 193 -> 315)
+--------------------------------------------------------------------------------
+
+  Phase 1 ended with a manifest whose chunk_count was hardcoded 0 and a
+  "populated in Phase 2" comment. That is now real.
+
+  What was added:
+    - loads ONE tokenizer + embedder for the whole run, before the source loop
+    - chunks each extracted Document, accumulating all_chunks
+    - per-source chunk counts and token stats in the manifest
+    - embeds ["{scheme_name} -- {section}\n{text}"], NOT the stored text
+    - upserts into Chroma, records vectors_stored
+    - delete_scheme() for any source that produced no chunks
+    - _token_stats() helper, _print_chunk_report()
+    - inspect_index() now prints live collection stats and the distance space
+
+  Manifest keys now include: chunk_count, vectors_stored, stale_chunks_removed,
+  embed_dim, embed_max_seq_length, chunk_hard_cap_tokens, chunk_overlap_tokens,
+  chunk_tokens{min,median,mean,max,count}, store_error.
+
+  Failure handling. A vector-store failure is caught, logged, and recorded in
+  both store_error and failures[], then the manifest is STILL written. The rule
+  is unchanged from Phase 1: one broken thing must not destroy the evidence for
+  the other four. But the manifest can now be internally inconsistent (chunks
+  counted, vectors not stored) -- that is deliberate and detectable, and
+  store_error is the flag that says so.
+
+  Embedding prefix rationale: "lock-in?" has to land on the ELSS tax section
+  and not on an unrelated ELSS paragraph. The prefix carries scheme + section
+  into the vector. The STORED text stays unprefixed so the debug panel shows
+  clean quotes.
+
+
+--------------------------------------------------------------------------------
+8. MEASURED RESULTS -- READ THESE, THEY CHANGE PHASE 3
+--------------------------------------------------------------------------------
+
+  Per scheme:
+
+    scheme                blocks  sections  chunks  expense  lock-in
+    large_cap                10        7       5    1.03%     --
+    flexi_cap                10        7       5    0.77%     --
+    elss                      9        6       5    1.21%   3 years
+    small_cap                10        7       5    0.78%     --
+    balanced_advantage       16        7       6    0.78%     --
+
+    TOTAL                    55       34      26
+
+  Token distribution: min 47 / median 87 / mean 91.7 / MAX 153.
+  Chunks pinned at the 240 cap: ZERO.
+
+  MEAN IS 91.7 AGAINST A 200 TARGET. This is not a tuning failure and the
+  implementation doc's "mean near 200" sanity check should be read as "nothing
+  is pinned at the cap", not as a literal target. Each page yields 9-16 short
+  blocks, and a "Fees, exit load and investment limits" section IS a single
+  61-83 token table. There is no 200-token run of prose to find. Packing is
+  bounded by section size. Splitting harder would only shred the tables.
+
+  CONSEQUENCE FOR PHASE 3: with 26 chunks, top_k=4 returns 15% of the entire
+  corpus. Precision must come from the score gate and the answer prompt, NOT
+  from chunk granularity. Do not try to fix this by re-chunking.
+
+
+--------------------------------------------------------------------------------
+9. MIN_SIMILARITY = 0.35 IS TOO HIGH. DO NOT SHIP IT.
+--------------------------------------------------------------------------------
+
+  Six-question probe against the real index. The correct chunk was rank 1 in
+  all six, but the SCORES are not comparable to a fixed cut:
+
+    "expense ratio of HDFC Large Cap Fund"      0.845   correct at rank 1
+    "who manages the small cap fund"             0.661   correct at rank 1
+    "minimum SIP amount for ELSS"                0.511   correct at rank 1
+    "benchmark of balanced advantage"            0.382   correct at rank 1
+    "can I get the tax statement"                0.327   NOT answerable
+    "is there a lock in period"                  0.166   correct at rank 1
+
+  A 0.35 gate would reject the CORRECT lock-in answer (0.166) and ACCEPT the
+  unanswerable statement question (0.327). It is worse than useless.
+
+  Why: a short, vague question matches a dense multi-row fees table weakly no
+  matter how good that chunk is. The right answer was retrieved; the score
+  just does not reflect it.
+
+  Phase 3 must therefore:
+    - tune on the eval set, not assume 0.35
+    - prefer RELATIVE gating (best hit vs the rest of top-k, plus a low
+      absolute floor) over a single absolute cut
+    - re-measure. The numbers above will move once the answer prompt and
+      reranking are in play, so treat them as a starting distribution, not a
+    threshold.
+
+
+--------------------------------------------------------------------------------
+10. TESTS                                       38 new (70 total)
+--------------------------------------------------------------------------------
+
+    tests/test_extractor.py    284 lines, 32 tests  (Phase 1, unchanged)
+    tests/test_chunker.py      397 lines, 23 tests  (NEW)
+    tests/test_store.py        227 lines, 15 tests  (NEW)
+    pytest.ini                   7 lines  (NEW -- registers the markers)
+
+  Timings on this machine:  pytest -q (all 70) ~9s, of which ~8s is the one
+  integration test loading the real tokenizer. The pre-commit gate
+  (not llm and not integration) is 69 tests in 0.7s with no model load.
+
+  Marker discipline:
+      -m "not llm"           no API key
+      -m "not integration"   no built index, no model download
+      -m integration         the real all-MiniLM tokenizer / a real index
+      -m llm                 needs a real ANTHROPIC_API_KEY
+  pytest.ini registers these, otherwise pytest warns on every run.
+
+  test_chunker.py uses TWO tokenizer doubles so the suite stays fast and needs
+  no 90MB download:
+      StubTokenizer     whitespace; exercises packing, overlap, splitting
+      SubwordTokenizer  cuts every 4 chars; simulates wordpiece, and is the
+                        only way to reach the _hard_cut path -- with a
+                        whitespace tokenizer one 5000-char "word" is a single
+                        token and never splits at all
+  The gap that leaves is covered by the one @pytest.mark.integration test,
+  which runs the real tokenizer and asserts every chunk fits max_seq_length.
+
+  test_store.py uses a tmp_path Chroma directory, so it NEVER touches the real
+  index. Vectors are deterministic one-hot lists; no model needed.
+
+  Covering store.py matters more than it looks: a test that wrote into the real
+  collection would corrupt the index and make every later "verification" run
+  depend on test order.
+
+
+--------------------------------------------------------------------------------
+11. THREE BUGS FOUND DURING PHASE 2 (all fixed, all regression-tested)
+--------------------------------------------------------------------------------
+
+a) Table rows mashed by overlap
+   The overlap tail was taken at the WORDPIECE level. Decoding 25 wordpieces
+   out of the middle of a table produced:
+
+       percent Expense ratio row 3 | value 3 percent Expense ratio row 4
+
+   and that became the first line of the NEXT chunk -- violating the
+   never-split-a-row invariant on a chunk that had passed all the row tests.
+   _overlap_tail now assembles whole trailing LINES and only falls back to a
+   token slice when a single line is too big for the budget.
+
+b) 397-token chunk, over the 240 cap
+   Follow-on from (a). Once the tail contained a newline, the line-aware path
+   took a single prose line that was itself larger than the ENTIRE overlap
+   budget, whole. 198 tokens of overlap + 198 of body = 397. The
+   hard-cap assertion fired, which is exactly why it was a raise and not a log.
+   _overlap_tail now delegates to a token slice in that case, so overlap can
+   never exceed its budget. Locked in by
+   test_overlap_never_exceeds_its_budget.
+
+c) Collection on the default L2 space
+   See section 6. The single most consequential bug of the phase, and it
+   produced no error at all -- it would have surfaced only as "the bot's
+   confidence numbers are weird" much later.
+
+  Also fixed en route: a parameter-order SyntaxError in upsert_chunks
+  (cfg=CONFIG before non-default params) and include=[] in delete_scheme,
+  which asks Chroma for ids without metadatas and so found nothing to delete.
+
+
+--------------------------------------------------------------------------------
+12. FILES TOUCHED OUTSIDE src/ingest/
+--------------------------------------------------------------------------------
+
+  docs/PRD.md            section 6.2 settled (heading-aware chosen, semantic
+                         rejected and WHY), measured 200/240/25 + real counts;
+                         section 6.3 gained the threshold warning in section 9
+  docs/architecture.md   section 5.3 strategy record + Phase 2 measurements +
+                         both overlap bugs; section 5.5 cosine requirement
+                         and the stale-chunk rule
+  docs/implementation.md section 2.6 added: exit-criteria table, real numbers,
+                         the three bugs, and the Phase 3 threshold warning
+  .gitignore             +3 lines: data/documents/ and data/index_manifest.json
+                         are now ignored. NOTE this reverses the Phase 1
+                         recommendation to commit them as an audit trail --
+                         the corpus is fully reproducible from 5 cached pages
+                         plus sources.md, and index_manifest.json is a
+                         build artifact that changes every run, so diffing it
+                         would be noise.
+  requirements.txt       chromadb>=0.5 and sentence-transformers>=3.0 were
+                         already listed in Phase 0; both are now INSTALLED at
+                         chromadb 1.5.9 / sentence-transformers 6.1.0
+
+
+--------------------------------------------------------------------------------
+13. HOW TO RE-RUN AND VERIFY
+--------------------------------------------------------------------------------
+
+  source .venv/bin/activate
+
+  python -m src.cli ingest --force     # reset the collection and rebuild
+  python -m src.cli ingest             # idempotent re-ingest from cache
+  python -m src.cli inspect            # manifest + per-source + collection
+  pytest -q                            # 70 tests, no network, no API key
+  pytest -m "not llm and not integration"   # fast pre-commit gate
+
+  VERIFY THE TWO NUMBERS THAT MATTER:
+
+  python -c "
+  from src.ingest.store import stats, count
+  from src.config import CONFIG
+  import json
+  m = json.load(open(CONFIG.manifest_path))
+  s = stats(CONFIG)
+  print('manifest chunk_count :', m['chunk_count'])
+  print('collection count     :', s['count'])
+  print('distance space       :', s['distance_space'])
+  print('embed model          :', s['embed_model'])
+  assert m['chunk_count'] == s['count'], 'MISMATCH'
+  assert s['distance_space'] == 'cosine', 'WRONG SPACE'
+  print('OK')"
+
+  Expect: 26 / 26 / cosine / OK
+
+  Idempotency check -- run ingest twice WITHOUT --force, the count must stay 26:
+
+  python -m src.cli ingest >/dev/null && python -m src.cli inspect | tail -6
+
+  Eyeball any chunk by hand, two independent ways:
+
+  (a) read it back out of the store by id:
+
+  python -c "
+  from src.config import CONFIG
+  from src.ingest.chunker import chunk_document
+  from src.ingest.embedder import get_embedder
+  from src.ingest.store import get_chunk
+  from src.models import Document
+  import json
+  doc = Document.from_dict(json.load(open('data/documents/large_cap.json')))
+  chunk = chunk_document(doc, CONFIG, get_embedder().tokenizer)[0]
+  stored = get_chunk(chunk.id, CONFIG)
+  print('id      ', chunk.id)
+  print('section ', stored.section, '| char_start', stored.char_start)
+  print('text    ', stored.text)
+  assert stored.text == chunk.text, 'store/text mismatch'"
+
+  (b) verify the chunk against the source document using char_start, which is
+      the whole reason char_start is recorded:
+
+  python -c "
+  import json
+  doc = json.load(open('data/documents/large_cap.json'))
+  body = '\n\n'.join(b['text'] for b in doc['blocks'])
+  print(repr(body[0:222]))"
+
+
+--------------------------------------------------------------------------------
+14. OPEN ITEMS CARRIED OUT OF PHASE 2
+--------------------------------------------------------------------------------
+
+BLOCKING A DECISION (needs the team, not the code):
+  A6  Still open, unchanged from Phase 1. "How do I download my capital gains
+      statement?" is not answerable from these 5 pages. Recommendation is
+      still option 3: drop the question and demo the refusal path, which is
+      itself a graded feature.
+
+NEW, HIGH PRIORITY:
+  A2  MIN_SIMILARITY -- now URGENT and now EVIDENCED. See section 9. 0.35 would
+      reject a correct answer and accept an unanswerable one. Do not hardcode
+      it; tune on the eval set and prefer relative gating. This is the first
+      thing Phase 3 should settle.
+
+CARRIED, STILL OPEN:
+  A3  EDU_LINK for the advice refusal (SEBI charter vs HDFC education).
+  A4  Commit chroma_db/ or require `cli ingest` before the demo. Unchanged
+      decision; note that a cold machine must download 87M of model weights and
+      build the index, so pre-warm it.
+
+NEW OBSERVATIONS, NO DECISION NEEDED YET:
+  - all-MiniLM-L6-v2 is general-purpose English, not finance-tuned. It handled
+    "expense ratio", "exit load" and "SIP" correctly at rank 1 across all six
+    probe questions, so a reranker is NOT needed yet. Revisit only if the
+    Phase 3 eval set shows real recall misses.
+  - A4b 26 chunks is a very small corpus. top_k=4 returning 15% of it means
+    the "no result" path needs more than a score threshold -- the retriever
+    should probably also consider whether the retrieved sections actually
+    address what was asked. Worth revisiting once there are more sources.
+
+CLOSED:
+  A1  Chunk params: 200/240/25 applied, tested against the real corpus, and
+      confirmed by an integration test. Fully closed.
+  A5  Already closed in Phase 1.
+  Phase 2 exit criteria  --  collection populated, count == manifest, manifest
+      written, tests pass, docs updated with real numbers. All met.
+
+
+--------------------------------------------------------------------------------
+15. GIT STATE
+--------------------------------------------------------------------------------
+
+  NOT COMMITTED. Unchanged from Phase 1, plus the Phase 2 files:
+
+    R  problemstatement.txt -> docs/Problemstatement.txt
+    ?? .env.example  .gitignore  README.md  pytest.ini  requirements.txt
+    ?? data/  docs/  src/  tests/
+
+  Ignored: .venv/  cache/  chroma_db/  data/documents/  data/index_manifest.json
+
+  Suggested commit message:
+    "Add chunking, embedding, and ChromaDB indexing with manifest"
+
+  Follow-up worth considering: pin the two new deps to the versions actually
+  verified (chromadb 1.5.9, sentence-transformers 6.1.0) rather than >=, so a
+  teammate's pip install in a month does not silently get a different Chroma
+  and a different default distance space.
+
+================================================================================
+END OF INTERNAL REFERENCE
+================================================================================

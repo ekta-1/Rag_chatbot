@@ -1,0 +1,545 @@
+================================================================================
+INTERNAL REFERENCE ONLY -- NOT A DELIVERABLE, NOT FOR SUBMISSION.
+Not part of the PRD, architecture, or demo. This is a build log for the team:
+what exists after Phase 3, which file does what, what the tuning evidence
+actually said, and what is still open.
+================================================================================
+
+
+PHASE 3 -- RETRIEVAL + SCORE GATE
+Status: COMPLETE and verified, ONE DECISION AWAITING SIGN-OFF
+Verified: 110 tests pass, 1 skipped | 6/6 answerable correct at rank 1 |
+          6/6 refusals return [] | 24 integration-marked, 87 fast
+Corpus consumed: unchanged (26 chunks, 5 schemes) -- Phase 3 does not re-ingest
+Corpus produced: nothing new. This phase adds a DECISION, not data.
+BLOCKED ON: user confirmation of MIN_SIMILARITY=0.30 and
+            MIN_LEXICAL_COVERAGE=0.55 before they are written to .env
+NOTE: Phases 0-2 are prerequisites and were already complete.
+
+
+--------------------------------------------------------------------------------
+1. THE HEADLINE: THE SINGLE-THRESHOLD PLAN WAS WRONG
+--------------------------------------------------------------------------------
+
+docs/implementation.md section 3.2 instructs: "The threshold goes BETWEEN the
+lowest positive top-1 score and the highest negative top-1 score."
+
+Measured on the real index, that is not achievable. There is no such value.
+
+    Question                                      Set          top-1 cosine
+    expense ratio of HDFC Large Cap Fund          answerable       0.816
+    exit load on HDFC Flexi Cap Fund              answerable       0.764
+    riskometer level HDFC Small Cap               answerable       0.625
+    benchmark of HDFC Balanced Advantage          answerable       0.622
+    lock-in period HDFC ELSS                      answerable       0.526
+    minimum SIP amount                            answerable       0.445
+    What is HDFC Bank's FD interest rate?         REFUSE           0.561  <--
+    Which fund is best for my portfolio?          REFUSE           0.486  <--
+    how to download capital gains statement       REFUSE (A6)      0.327
+    Tell me about Bitcoin.                        REFUSE           0.164
+    What is the weather in Mumbai?                REFUSE           0.153
+    What is the price of gold today?              REFUSE           0.150
+
+    COSINE GAP = 0.445 (lowest answerable) - 0.561 (highest refuse) = -0.116
+
+Two questions we CANNOT answer outscore three we CAN. The two offenders are
+exactly the finance-adjacent negatives. "What is the weather in Mumbai" is easy
+to refuse; "What is HDFC Bank's FD interest rate?" is not, because:
+
+  - every chunk embedding is prefixed with the scheme name, so any question
+    containing "HDFC" gets a cosine boost against all 26 chunks
+  - "interest rate" is semantically close to "expense ratio"
+  - the index is small enough that 4 hits = 15% of the corpus
+
+`cli ask "What is HDFC Bank's FD interest rate?" --explain` shows the whole
+mechanism in one line:
+
+    1. FAIL (coverage 0.078 < 0.55)  sim=0.561 cov=0.078
+       [balanced_advantage / Fees, exit load and investment limits]
+       matched: hdfc
+
+It matched on the single token "hdfc" and nothing else.
+
+This is why A2 was flagged as the highest-risk item in Phase 2. Phase 2's
+evidence (correct answer scoring 0.166, hard negative 0.327) was a symptom of
+this same collision, and it got worse as the question set grew.
+
+
+--------------------------------------------------------------------------------
+2. THE FIX: A SECOND, ORTHOGONAL SIGNAL
+--------------------------------------------------------------------------------
+
+docs/implementation.md section 3.2 anticipates this failure: "if the sets do not
+separate, add the lexical signal from section 3.4 rather than lowering the bar
+until A6 passes."
+
+Implemented as src/rag/lexical.py -- IDF-weighted lexical coverage: the fraction
+of the question's DISTINCTIVE vocabulary that the chunk actually contains.
+
+    coverage = sum(idf(t) for t in query_terms if t in chunk) / sum(idf(t) for t in query_terms)
+    idf(t)   = log((N+1)/(df(t)+1)) + 1
+
+    Measured, same 12 questions:
+
+    Signal        answerable min    refuse max      gap
+    cosine              0.445          0.561      -0.116   FAILS
+    lexical coverage    0.637          0.494      +0.143   WORKS
+
+Why IDF rather than raw term counts: "fund", "HDFC" and "expense" appear across
+many chunks and must not count for much; "riskometer" and "lock-in" appear in
+one and must count for a lot. A raw-count overlap would call the FD question a
+good match because both strings contain "HDFC". The IDF weighting is what makes
+"hdfc" alone score 0.078 instead of 1.0.
+
+No hand-maintained list of financial filler words. The ~40 stopwords are generic
+English function and interrogative words only ("what", "which", "is", "of").
+Domain words are deliberately NOT stopwords -- "lock-in" and "expense" must keep
+their weight, and IDF already down-weights the common ones on its own.
+
+BOTH gates must pass. Either alone is insufficient, and the two are genuinely
+orthogonal: cosine finds the plausible chunk, coverage checks it is really about
+what was asked.
+
+
+--------------------------------------------------------------------------------
+3. PROPOSED VALUES -- NOT YET IN .env, AWAITING SIGN-OFF
+--------------------------------------------------------------------------------
+
+  MIN_SIMILARITY        = 0.30
+  MIN_LEXICAL_COVERAGE  = 0.55
+
+  MIN_SIMILARITY is deliberately LOOSE. The lowest answerable score is 0.445,
+  and 0.30 sits well under it, so the cosine gate never rejects a genuinely good
+  chunk. It is a sanity floor, not the discriminator -- a loose gate that never
+  fires is better than a tight one that causes silent false refusals.
+
+  MIN_LEXICAL_COVERAGE is the gate doing the real work. 0.55 sits between the
+  refuse maximum (0.494) and the answerable minimum (0.637), with roughly
+  +0.06 margin on the refuse side and +0.09 on the answerable side.
+
+  A grid search over coverage in [0.20, 0.85] x cosine in [0.20, 0.55] found 15
+  valid operating points. The usable region is:
+
+      coverage in {0.50, 0.55, 0.60}  AND  cosine in {0.20 ... 0.40}
+
+  0.55 / 0.30 is the centre of that region. The thresholds are NOT tight: small
+  corpus drift will not break them, which is what we want for a class demo.
+
+Both are already the values in src/config.py defaults and in .env.example, so
+nothing needs changing to accept them -- only the user's confirmation before
+copying to .env.
+
+tests/test_retriever.py::test_thresholds_have_a_separation_margin asserts that
+min(answerable) > max(refuse) and that the configured value sits between them.
+If a re-ingest changes the corpus, or someone lowers a threshold, the suite
+fails instead of the refusal path degrading unnoticed.
+
+
+--------------------------------------------------------------------------------
+4. src/rag/retriever.py                      229 lines  (NEW)
+--------------------------------------------------------------------------------
+
+  class Retriever:
+      __init__(cfg)               - embedder (imported, never re-instantiated),
+                                    lexical gate, collection validation
+      search(query, top_k,        - THE GATE. Returns only hits clearing both
+             scheme_key, augment)    conditions, ranked, capped at top_k
+      explain(query, top_k, ...)  - diagnostic: both signals + verdict + which
+                                    terms matched, per candidate
+      index_size                  - property
+
+  Non-obvious decisions:
+
+  - The gate is INSIDE search(). A gate that callers can forget is not a
+    defence. This is architecture decision D5 and the reason search() is the
+    only supported entry point.
+  - _candidates() over-fetches (top_k * 3). Gating on a shallow top_k starves
+    the result: a high-similarity / low-coverage chunk will otherwise crowd out
+    a lower-similarity chunk that actually contains the answer. "benchmark of
+    HDFC Balanced Advantage" hit exactly this case -- the correct chunk was
+    ranked 8th on a top_k=4 over-fetch of 4.
+  - The query is embedded with NO document prefix. The prefix describes the
+    chunk, not the question. augment_query() may append a bare scheme_key
+    (see section 7) but never "{scheme_name} - {section}".
+  - Imports Embedder from src.ingest.embedder. A second SentenceTransformer is a
+    silent retrieval bug the instant the two disagree on pooling or
+    normalisation.
+  - Two guard exceptions, IndexModelMismatch and EmptyIndexError, both caught in
+    cli.py with the right exit code and a runnable next command.
+
+  RANKING IS score x COVERAGE, NOT score ALONE. See section 6.
+
+  The gate returns a reason string ("coverage 0.078 < 0.55") on every rejection.
+  That is what makes a bad threshold debuggable instead of mysterious -- you can
+  always answer "which gate fired, and on what number".
+
+
+--------------------------------------------------------------------------------
+5. src/rag/lexical.py                        133 lines  (NEW, not in the plan)
+--------------------------------------------------------------------------------
+
+  class LexicalGate:
+      from_collection(cfg)  - builds IDF stats by reading the stored collection
+      idf(term)
+      coverage(question, chunk_embedding_text)
+      matched_terms(question, chunk_embedding_text)   - why a hit failed
+  tokenize(text) -> set[str]
+
+  Added beyond the file list in implementation.md section 3.1. It is a distinct
+  concern with its own testable surface, and folding it into retriever.py would
+  have mixed vector search and string matching in one file.
+
+  ONE SUBTLETY THAT MATTERS A LOT. from_collection() reconstructs each chunk's
+  EMBEDDING text ("{scheme_name} - {section}\n{body}") and scores against that,
+  not against the bare stored body. During tuning, scoring against the bare body
+  dropped coverage to ~0.0 for every scheme-named question -- because the stored
+  body does not contain the word "HDFC", only the prefix does. That made every
+  answerable question look like a refusal and briefly suggested the whole
+  approach was unsalvageable. The two signals must be computed over the SAME
+  string, or the gate is incoherent.
+
+  The reconstructed string is not persisted. It is rebuilt from metadata that
+  IS persisted (scheme_name, section), so it stays correct across re-ingests
+  without a schema change.
+
+
+--------------------------------------------------------------------------------
+6. SECOND FINDING: RANKING BY COSINE ALONE WAS WRONG
+--------------------------------------------------------------------------------
+
+For "benchmark of HDFC Balanced Advantage", top-1 was the FEES chunk, not the
+BENCHMARK chunk. The two are nearly tied on cosine:
+
+    Fees       0.622  coverage 0.695     <- won on cosine
+    Benchmark  0.607  coverage 1.000     <- the right answer
+
+Cause: every chunk of a fund is prefixed with that fund's name, so "HDFC
+Balanced Advantage" matches the fees chunk, the benchmark chunk and the overview
+chunk EQUALLY. Cosine cannot break that tie, and the one discriminating term
+("benchmark") gets swamped. The fees chunk won on a coin flip.
+
+Ranking by score x coverage fixes it, because the correct chunk has strictly
+higher coverage. Effect on the eval set:
+
+    top-1 correct, ranked by cosine ............ 5/6
+    top-1 correct, ranked by score x coverage ... 6/6
+
+IMPORTANT: Hit.score is left as the RAW COSINE value. Only the sort key is the
+product. The thresholds are defined against cosine, so score must keep meaning
+cosine or MIN_SIMILARITY becomes unfalsifiable. Do not "simplify" this by storing
+the blended value in score.
+
+
+--------------------------------------------------------------------------------
+7. THIRD FINDING: SECTION 3.4's SCHEME-KEY FIX DOES NOT HELP
+--------------------------------------------------------------------------------
+
+Implementation.md section 3.4 says the cheap recall fix is to append the matching
+scheme_key to the question text before embedding, and to log whether it helped.
+
+It does not help. Measured, augment on vs off, top-1 cosine:
+
+    question                                     off      on     delta
+    expense ratio of HDFC Large Cap Fund       0.846   0.816   -0.029
+    exit load on HDFC Flexi Cap Fund           0.794   0.764   -0.030
+    benchmark of HDFC Balanced Advantage        0.625   0.622   -0.002
+    riskometer level HDFC Small Cap            0.607   0.625   +0.018
+    lock-in period HDFC ELSS                   0.520   0.526   +0.006
+    minimum SIP amount                         0.445   0.445    0.000
+
+Net effect zero, and slightly NEGATIVE on the two cleanest questions. It also
+cannot fix the two colliding negatives, because those name no scheme and so have
+nothing to append.
+
+Implemented and measured, then left available behind the augment= flag but
+DEFAULTING TO THE PLAIN QUESTION. The spec asked for it to be logged; this is
+that log. Consequence: no cross-encoder reranker is warranted on current
+evidence. Revisit only if the Phase 4 end-to-end eval shows real recall misses.
+
+
+--------------------------------------------------------------------------------
+8. CLI CHANGES
+--------------------------------------------------------------------------------
+
+src/cli.py                              87 -> 136 lines
+
+  ask   now prints RETRIEVAL ONLY -- rank, score, scheme, section, chunk text.
+        No LLM call, no API key needed. That is deliberate: retrieval can be
+        debugged in a demo without a key, and Phase 4 layers the answer on top.
+  ask --explain
+        NEW, not in the plan. Prints every candidate with both gate signals, the
+        pass/fail verdict and WHY, and which query terms matched. This is what
+        turned section 1 from a hunch into a diagnosis.
+  ask   on refusal prints the two-gate refusal message naming both conditions.
+  ask   returns exit 1 for a missing index, 2 for an embedding model mismatch.
+  inspect
+        unchanged in behaviour; already prints manifest, per-source counts and
+        collection stats from Phase 2.
+
+src/config.py                        126 -> 134 lines
+  min_similarity            0.35 -> 0.30
+  min_lexical_coverage      NEW, 0.55
+  Both are read from env with those defaults, so .env can override either.
+
+
+--------------------------------------------------------------------------------
+9. store.py CHANGE (small, but a real gap)
+--------------------------------------------------------------------------------
+
+src/ingest/store.py                   290 -> 300 lines
+
+  upsert_chunks() gained an embed_model parameter.
+
+  It previously called ensure_collection(cfg), which assumes cfg.embed_model.
+  That is correct for the normal ingest path, but it left no way to write into a
+  collection built by a different model on purpose -- which is exactly what the
+  new test_retriever_rejects_a_model_mismatch test needs to construct. The test
+  caught the gap rather than the test being written around it.
+
+  Also note: no Chroma behaviour changed. Distance space stays cosine, ids stay
+  deterministic, the model guard is unchanged.
+
+
+--------------------------------------------------------------------------------
+10. TESTS                                  41 new (111 total: 110 pass, 1 skip)
+--------------------------------------------------------------------------------
+
+    tests/test_extractor.py    284 lines, 32 tests  (Phase 1)
+    tests/test_chunker.py      397 lines, 23 tests  (Phase 2)
+    tests/test_store.py        227 lines, 15 tests  (Phase 2)
+    tests/test_retriever.py    300 lines, 41 tests  (NEW)
+
+    Marker split:
+      87 tests, 0.7s   -m "not llm and not integration"   (the pre-commit gate)
+      24 tests, ~10s   -m integration                     (real model + index)
+      1 skipped        the A6 positive-shaped query, which must be REFUSED
+
+  The 41 split roughly 20 pure-logic (tokenize, IDF, coverage, scheme
+  detection, augment_query, gate construction) and 21 integration.
+
+  The two most valuable tests are the ones that fail LOUDLY on regression:
+
+    test_thresholds_have_a_separation_margin
+        Asserts min(answerable coverage) > max(refuse coverage) and that the
+        configured value sits between them. This is the test that would catch a
+        careless threshold edit or a corpus change. Without it, lowering
+        MIN_LEXICAL_COVERAGE to 0.3 would make every test still pass while
+        quietly destroying the refusal path.
+
+    test_gate_explains_which_condition_rejected_a_question
+        Asserts the FD question has cosine ABOVE the floor and coverage BELOW it.
+        It pins the exact failure mode the lexical gate was added for. If a future
+        model or prefix change makes the cosine drop instead, this test tells you
+        the diagnosis itself has changed.
+
+  Also deliberately locked in: test_a6_statement_query_is_refused, with a comment
+  explaining that if someone "fixes" it by adding a fuzzy fallback, that is a
+  regression, not a fix.
+
+  And the honest one: the A6 query sits in the POSITIVES table with section=None
+  and pytest.skip, rather than being quietly deleted from the list. It is
+  documented in the test file that it is really a refusal case.
+
+
+--------------------------------------------------------------------------------
+11. FULL EVAL RESULT
+--------------------------------------------------------------------------------
+
+  Answerable (must return the right fund AND section at rank 1):
+
+    PASS  expense ratio of HDFC Large Cap Fund    0.816 cov 1.000
+          large_cap / Fees, exit load and investment limits
+    PASS  exit load on HDFC Flexi Cap Fund        0.764 cov 1.000
+          flexi_cap / Fees, exit load and investment limits
+    PASS  minimum SIP amount                      0.445 cov 1.000
+          small_cap / Fees, exit load and investment limits
+    PASS  lock-in period HDFC ELSS                0.526 cov 1.000
+          elss / Fees, exit load and investment limits
+    PASS  benchmark of HDFC Balanced Advantage    0.622 cov 1.000
+          balanced_advantage / Benchmark, risk and scheme profile
+    PASS  riskometer level HDFC Small Cap         0.625 cov 0.637
+          small_cap / Benchmark, risk and scheme profile
+
+                                                        6/6
+
+  Refusals (must return []):
+
+    PASS  how to download capital gains statement   0.327 cov 0.147
+    PASS  What is HDFC Bank's FD interest rate?     0.561 cov 0.078
+    PASS  Which fund is best for my portfolio?      0.486 cov 0.494
+    PASS  What is the weather in Mumbai?            0.153 cov 0.456
+    PASS  Tell me about Bitcoin.                    0.164 cov 0.000
+    PASS  What is the price of gold today?          0.150 cov 0.000
+
+                                                        6/6
+
+  Note "weather in Mumbai" reaches coverage 0.456 -- uncomfortably close to the
+  0.55 gate -- and the reason is worth knowing. "mumbai" is a rare term in this
+  index (df = 1, so high IDF) because it appears in exactly one chunk, in a fund
+  manager's qualifications: "CA (ICAI, INDIA), B.Com (University of Mumbai)".
+  "mumbai" alone therefore carries about half the query's IDF weight, and one of
+  two query terms matching yields 0.456.
+
+  It is still correctly refused, because its cosine is 0.130 -- well under the
+  0.30 floor. So this is the two gates doing exactly their job: a coincidental
+  proper-noun match produced a mediocre lexical score, and the cosine signal
+  caught the nonsense. Neither gate is redundant, and the residual risk of a
+  rare-term coincidence is covered by requiring BOTH.
+
+  The A6 statement query is a POSITIVE-SHAPED question that no source covers.
+  It is correctly refused and must stay that way until the team decides on A6.
+
+
+--------------------------------------------------------------------------------
+12. HOW TO RE-RUN AND VERIFY
+--------------------------------------------------------------------------------
+
+  source .venv/bin/activate
+
+  python -m src.cli ask "exit load on HDFC Flexi Cap Fund"
+  python -m src.cli ask "What is HDFC Bank's FD interest rate?"    # expect refusal
+  python -m src.cli ask "What is HDFC Bank's FD interest rate?" --explain
+  python -m src.cli inspect
+  pytest -q                                                       # 110 pass
+  pytest -m "not llm and not integration"                         # 87, ~0.7s
+
+  Confirm both gates are live and configured:
+
+  python -c "
+  from src.rag.retriever import Retriever
+  r = Retriever()
+  print('cosine gate  :', r.cfg.min_similarity)
+  print('coverage gate:', r.cfg.min_lexical_coverage)
+  print('index size   :', r.index_size)
+  print('below both   :', r.search('Tell me about Bitcoin.') == [])
+  print('above both   :', len(r.search('expense ratio of HDFC Large Cap Fund')) > 0)"
+
+  Re-verify the separation gap at any time -- this is the number to watch if the
+  corpus ever changes:
+
+  python -c "
+  from src.rag.retriever import Retriever
+  r = Retriever()
+  a = [max(x['coverage'] for x in r.explain(q)) for q in
+       ['expense ratio of HDFC Large Cap Fund','exit load on HDFC Flexi Cap Fund',
+        'minimum SIP amount','lock-in period HDFC ELSS',
+        'benchmark of HDFC Balanced Advantage','riskometer level HDFC Small Cap']]
+  n = [max(x['coverage'] for x in r.explain(q)) for q in
+       ['how to download capital gains statement','What is HDFC Bank FD interest rate?',
+        'Which fund is best for my portfolio?','What is the weather in Mumbai?',
+        'Tell me about Bitcoin.','What is the price of gold today?']]
+  print(f'answerable min {min(a):.3f} | refuse max {max(n):.3f} | gap {min(a)-max(n):+.3f}')
+  assert min(a) > max(n), 'SETS NO LONGER SEPARATE -- re-tune'"
+
+  Expect: answerable min 0.637 | refuse max 0.494 | gap +0.143
+
+
+--------------------------------------------------------------------------------
+13. DOCS UPDATED WITH THE REAL NUMBERS
+--------------------------------------------------------------------------------
+
+  docs/architecture.md   section 5.6 rewritten: the full 12-row score table, the
+                         -0.116 cosine gap, the +0.143 coverage gap, the two
+                         tuned values, why ranking uses the product, and why
+                         section 3.4's fix was abandoned
+  docs/architecture.md   section 12: A2 marked RESOLVED, with the note that it
+                         was resolved differently than planned
+  docs/implementation.md new section 3.5: outcome table, the falsified
+                         single-threshold premise, and the two added files
+
+  Not updated: docs/PRD.md. It is the requirements document and the
+  implementation no longer matches its section 6.3 wording, which describes a
+  single minimum score threshold. Flagged in section 14 below rather than
+  silently rewritten, because changing the PRD's acceptance criteria is a
+  product decision, not an engineering one.
+
+
+--------------------------------------------------------------------------------
+14. OPEN ITEMS
+--------------------------------------------------------------------------------
+
+BLOCKING, AWAITING THE TEAM:
+  A2  The tuned values MIN_SIMILARITY=0.30 and MIN_LEXICAL_COVERAGE=0.55 are
+      measured, evidence-backed and sitting in config.py and .env.example, but
+      NOT written to .env. The spec says to confirm before setting. Awaiting
+      explicit sign-off.
+
+  A6  Unchanged and still open: "how to download my capital gains statement?"
+      is not answerable from these 5 pages. Phase 3 makes the bot REFUSE it
+      correctly, which is the Phase 1 recommendation (option 3) working as
+      intended. The decision is whether to keep refusing or add a source.
+
+  A7  NEW, needs a product decision, not code. The PRD (section 6.3) specifies
+      ONE minimum score threshold. The implementation now uses TWO required
+      gates, because one provably cannot separate the eval sets. Either the PRD
+      is updated to describe the two-gate gate, or the requirement stands and
+      the refusal path stays broken. This is the single most important thing to
+      resolve before the demo, because the demo WILL be asked "why did it
+      refuse a question I can answer on the Groww page?" and the honest answer
+      is "because a pure embedding threshold cannot tell a missing fact from an
+      unfamiliar phrasing".
+
+CLOSED:
+  A2-technically  Tuned, evidenced, documented -- pending sign-off only.
+  Phase 3 exit criteria  6/6 answerable correct at rank 1, 6/6 refusals, both
+      thresholds recorded in architecture 5.6 and 12. All met.
+
+STILL OPEN, CARRIED:
+  A3  EDU_LINK for the advice refusal. Needed for Phase 4.
+      NOTE: "Which fund is best for my portfolio?" is already correctly refused
+      at the RETRIEVAL layer, so Phase 4 must not treat a retrieved result as
+      implying the question was answerable. The prompt-level refusal in
+      architecture 5.7 rule 4 is still worth having as defence in depth.
+  A4  Commit chroma_db/ or require `cli ingest` before the demo.
+
+NEW OBSERVATIONS, NO DECISION NEEDED:
+  - The lexical gate generalises better than a threshold would. Adding a 6th
+    fund changes the IDF statistics slightly but does not invalidate the
+    principle. A threshold tuned on 26 chunks would need re-tuning on 30.
+  - A cross-encoder reranker is NOT justified. Section 7 shows the cheap fix
+    gained nothing; a reranker would be a large cost for an unmeasured gain on
+    a corpus where top-1 is already 6/6.
+  - Retrieval quality is now good enough that Phase 4 can be built on it without
+    re-tuning. The remaining risk in the system is generation and citation
+    validation, not retrieval.
+
+ENVIRONMENT:
+  .venv unchanged in this phase -- no new packages. 1.4G, model cached at
+  ~/.cache/huggingface (87M).
+
+
+--------------------------------------------------------------------------------
+15. GIT STATE
+--------------------------------------------------------------------------------
+
+  NOT COMMITTED. Everything is still untracked from Phase 0 onward:
+
+    R  problemstatement.txt -> docs/Problemstatement.txt
+    ?? .env.example  .gitignore  README.md  pytest.ini  requirements.txt
+    ?? data/  docs/  src/  tests/
+
+  IMPORTANT: because src/ and tests/ have never been committed, git cannot
+  distinguish this phase's changes from Phases 1-2. `git diff` will show nothing.
+  The files written or changed in Phase 3 are:
+
+    NEW      src/rag/retriever.py       src/rag/lexical.py
+             tests/test_retriever.py
+    CHANGED  src/cli.py                  (ask rewritten, --explain added)
+             src/config.py               (2 threshold fields)
+             src/ingest/store.py         (upsert_chunks embed_model param)
+             .env.example                (2 threshold vars + rationale)
+             docs/architecture.md        (section 5.6 rewritten, section 12 A2)
+             docs/implementation.md      (new section 3.5)
+
+  Ignored: .venv/  cache/  chroma_db/  data/documents/  data/index_manifest.json
+
+  Suggested commit message:
+    "Add retrieval with two-gate answerability check and tune thresholds"
+
+  Better than the plan's suggested message, because "score gating" alone would
+  misdescribe what was built.
+
+
+================================================================================
+END OF INTERNAL REFERENCE
+================================================================================

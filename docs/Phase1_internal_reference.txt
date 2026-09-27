@@ -1,0 +1,332 @@
+================================================================================
+INTERNAL REFERENCE ONLY -- NOT A DELIVERABLE, NOT FOR SUBMISSION.
+Not part of the PRD, architecture, or demo. This is a build log for the team:
+what exists after Phase 1, which file does what, and what is still open.
+================================================================================
+
+
+PHASE 1 -- INGESTION (FETCH + EXTRACT)
+Status: COMPLETE and verified
+Verified: 32/32 tests pass | 5/5 sources ingested | manifest failures: 0
+Corpus produced: 55 blocks / ~10,500 chars across 5 schemes
+NOTE: Phase 0 (scaffolding) was a prerequisite and is also done. Listed below.
+
+
+--------------------------------------------------------------------------------
+1. PHASE 0 -- SCAFFOLDING (prerequisite, also complete)
+--------------------------------------------------------------------------------
+
+src/config.py                          126 lines
+    Frozen Config dataclass. Every tunable in the pipeline is read from here
+    exactly once. Exports CONFIG as a shared instance.
+    Notable: chunk_size_tokens=200, chunk_hard_cap_tokens=240,
+    chunk_overlap_tokens=25, min_block_chars=40, min_similarity=0.35.
+    Paths resolve relative to PROJECT_ROOT, not the CWD.
+
+src/models.py                          142 lines
+    Data contracts shared by every stage. Dataclasses only, no logic.
+      Source      - one URL from data/sources.md
+      TextBlock   - section + text + kind ("prose"|"table"|"list")
+      Document    - all blocks for one page, with ingested_at
+      Chunk       - embeddable unit + all metadata needed to cite it
+                   (has .embedding_text() which adds the scheme/section
+                   prefix used in Phase 2)
+      Hit         - retrieved chunk + similarity score
+      Answer      - final response + hits, for the UI and the debug panel
+    Also: make_chunk_id() = sha1(source_url|section|chunk_index). Deterministic
+    ids are what let a re-ingest upsert in place instead of duplicating rows.
+
+src/cli.py                              87 lines
+    argparse entry point. Subcommands: ingest [--force] [--refresh],
+    ask "<question>", inspect.
+    Heavy imports (chromadb, sentence-transformers, anthropic) are deferred
+    into the handlers, so --help and ingest work before those are installed.
+
+.env.example                            19 lines
+    Original 6 vars plus MIN_SIMILARITY, CHUNK_SIZE_TOKENS,
+    CHUNK_HARD_CAP_TOKENS, CHUNK_OVERLAP_TOKENS, REQUEST_DELAY_SECONDS.
+    NOT yet copied to .env. No ANTHROPIC_API_KEY set -- not needed until
+    Phase 4.
+
+.gitignore                              9 lines
+    Added cache/ (raw HTML, 2.6M) on top of the original entries.
+    chroma_db/ was already ignored from the start.
+
+
+--------------------------------------------------------------------------------
+2. PHASE 1.1 -- SOURCE LIST PARSER
+--------------------------------------------------------------------------------
+
+src/ingest/sources.py                   78 lines
+    load_sources() parses the markdown table in data/sources.md into Source
+    records. No markdown library -- splits on "|" and validates by hand.
+    Raises on: missing field, duplicate scheme_key, non-https url, empty
+    result. Loud failure is deliberate: a silently empty source list is the
+    worst possible ingest bug.
+
+    Input file (pre-existing, unchanged):
+    data/sources.md                     5 rows: large_cap, flexi_cap, elss,
+                                        small_cap, balanced_advantage
+
+
+--------------------------------------------------------------------------------
+3. PHASE 1.2 -- FETCHER (cache-first)
+--------------------------------------------------------------------------------
+
+src/ingest/fetcher.py                   93 lines
+    fetch() returns raw HTML, cached to cache/raw_html/<scheme_key>.html.
+      - Reuses the cache unless refresh=True. This is architecture decision
+        D10 and is what stops a DOM change or flaky network from breaking a
+        live demo.
+      - Browser-like User-Agent (a default python-requests UA gets blocked).
+      - Retries on 429/5xx with 2s/4s/8s backoff, 3 attempts.
+      - Raises RuntimeError after exhausting retries.
+    Politeness sleep lives in the caller (pipeline), not here.
+
+    Generated (gitignored):
+    cache/raw_html/*.html               5 files, 2.6M total
+
+
+--------------------------------------------------------------------------------
+4. PHASE 1.3 -- EXTRACTOR (DOM -> text blocks)
+--------------------------------------------------------------------------------
+
+src/ingest/extractor.py                351 lines
+    The highest-risk module. extract() walks the DOM in document order and
+    emits TextBlocks carrying their heading context.
+
+    Why section/kind are preserved instead of flattening to one string:
+    they are what make heading-aware chunking (Phase 2) and precise
+    citations (Phase 4) possible.
+
+    Key functions:
+      extract()            - main entry; optional stats dict reports drops
+      _walk()              - recursive document-order walk
+      _flatten_table()     - one line per <tr>, cells joined by " | "
+      _flatten_list()      - one "- item" per line
+      clean_text()         - collapse whitespace, strip zero-width,
+                            redact 12+ digit runs
+      clean_prose()        - same, plus collapse source line wrapping
+                            (prose only; tables/lists keep their newlines)
+      coverage_report()    - which answerable fields are present
+      missing_fields()     - the inverse
+
+    Filters, and why each exists (do not simplify these away):
+      STRIP_TAGS                - script/style/noscript/nav/header/footer/
+                                  aside/form/svg
+      NOISE_MARKERS             - cookie/consent/popup/newsletter, PLUS
+                                  header/footer/navbar/dropdown/carousel.
+                                  Needed because Groww wraps its whole shell
+                                  in <div class="header2025_headerContainer__">
+                                  -- a CUSTOM ELEMENT, so a literal <header>
+                                  selector cannot catch it.
+      BLOCKED_SECTION_PREFIXES  - Holdings, Return calculator, Compare
+                                  similar funds. Returns/holdings are
+                                  forbidden by the PRD; holdings alone were
+                                  24,562 of 39,880 chars on one page.
+      BLOCKED_CONTENT_MARKERS   - marketing ("demat account", "etf screener",
+                                  ...) and returns tables ("fund returns",
+                                  "category average").
+      BLOCKED_CONTENT_PREFIXES  - "address". The AMC postal address is
+                                  byte-identical on all 5 pages and would eat
+                                  4 of 4 TOP_K slots.
+      min_block_chars = 40      - tested at 30, REVERTED. At 30 it admitted a
+                                  carousel of OTHER HDFC schemes, which would
+                                  cite the wrong scheme confidently. Short
+                                  values do not need it relaxed, because
+                                  structured.py supplies them exactly.
+
+
+--------------------------------------------------------------------------------
+5. PHASE 1.3b -- STRUCTURED FACTS  (ADDED, NOT IN THE ORIGINAL PLAN)
+--------------------------------------------------------------------------------
+
+src/ingest/structured.py               179 lines
+    THE BIGGEST FINDING OF PHASE 1. Groww is a Next.js app: every fact the
+    FAQ needs is NOT in the rendered HTML. It lives in a JSON payload at
+    <script id="__NEXT_DATA__"> -> props.pageProps.mfServerSideData.
+
+    Proof it matters: a prose-only scrape found ZERO occurrences of
+    "expense ratio" across all 5 pages. The payload has all of them.
+
+      load_server_data()  - pull mfServerSideData, {} if absent
+      extract_facts()     - emit labelled "label | value" table blocks
+      facts_summary()     - flat dict for the CLI report
+
+    Output looks like:
+      Fees, exit load and investment limits
+        Expense ratio | 1.03%
+        Exit load | Exit load of 1% if redeemed within 1 year
+        Lock-in period | 3 years        <- ELSS only; row omitted when null
+        Minimum SIP amount | INR 100
+      Benchmark, risk and scheme profile
+        Benchmark | NIFTY 100 TRI
+        Riskometer | Moderately High Riskometer
+
+    Design: ALLOWLIST, not blocklist. FACT_SECTIONS names every field we
+    ingest. EXCLUDED_FIELDS names what must never be ingested --
+    return_stats, simple_return, sip_return, nav, groww_rating, crisil_rating,
+    peerComparison, aum, historic_*. All are present and reachable in the
+    payload; excluding them at the source is how the PRD's "no performance
+    claims" rule is enforced STRUCTURALLY rather than by prompt.
+
+    Missing payload is NOT an error -- falls back to prose only.
+
+
+--------------------------------------------------------------------------------
+6. PHASE 1.4 -- PIPELINE / CLI WIRING
+--------------------------------------------------------------------------------
+
+src/ingest/pipeline.py                 193 lines
+    run_ingest(force, refresh) orchestrates the offline run.
+      - load sources -> fetch -> extract_facts -> extract -> write
+      - Fact blocks are prepended so authoritative numbers lead the document
+        and the chunker does not have to compete with prose for room.
+      - ONE failing source is recorded in failures[] and does not abort the
+        run. One broken page must not cost us the other four.
+      - All schemes share ONE ingested_at timestamp per run.
+    _print_coverage() distinguishes two cases on purpose:
+      - missing from ALL schemes -> real ingestion failure, WARNING
+      - missing from SOME schemes -> often correct (lock-in is ELSS-only),
+        printed as a Note, not a warning. Avoids crying wolf.
+    inspect_index() prints the manifest (collection stats come in Phase 2).
+
+    Generated (NOT yet gitignored, NOT yet committed):
+    data/documents/*.json               5 files, 24K -- cleaned text per scheme
+    data/index_manifest.json            8K -- ingested_at, per-source blocks/
+                                        chars/sections/coverage/facts, failures
+
+
+--------------------------------------------------------------------------------
+7. PHASE 1.5 -- TESTS
+--------------------------------------------------------------------------------
+
+tests/test_extractor.py                284 lines, 32 tests, all passing
+    Runs entirely against a local fixture. No test touches the network.
+
+tests/data/fixtures/scheme_page.html   Hand-written compact fixture (~4K vs
+                                       453K for the real page) mirroring the
+                                       real DOM: nav, cookie banner, headings,
+                                       fee table, lists, carousel, holdings,
+                                       return calculator, comparison table,
+                                       footer, and a __NEXT_DATA__ payload
+                                       including banned fields.
+
+    Coverage by area:
+      clean_text      - redacts 12+ digit runs, KEEPS fee percentages
+      noise removal   - nav, footer, cookie, newsletter, script bodies
+      structure       - section never empty, table rows keep label+value on
+                        one line, list items extracted, row count matches
+      robustness      - garbage HTML raises, malformed HTML does not
+      blocklist       - holdings / return calculator / comparison / returns
+                        table / carousel / address all excluded; useful prose
+                        survives; drop counters reported
+      structured      - payload parsed, exact values, null lock-in omitted,
+                        returns+ratings never ingested, missing payload safe
+      coverage        - core facts reported as covered
+
+    Bug found and fixed by these tests: a {section: text} dict in one test
+    collapsed duplicate section names and silently hid a failure. Tests were
+    iterating a lossy structure, not the code being wrong.
+
+
+--------------------------------------------------------------------------------
+8. TWO BUGS HIT DURING IMPLEMENTATION (both fixed, both now regression-tested)
+--------------------------------------------------------------------------------
+
+a) AttributeValueList crash
+   tag.get("class") returns a LIST for multi-valued attributes, so the naive
+   " ".join() in _is_noise() raised "expected str instance". Fixed with
+   _attr_text() normaliser.
+
+b) Decomposed-tag crash
+   soup.find_all() returns a list; decompose() on an outer element also
+   decomposes its descendants, which are STILL in that list. Iterating them
+   gave "'NoneType' object has no attribute 'get'". Fixed with explicit
+   .decomposed guards in both the filter loop and the DOM walk.
+
+   Both are classic bs4 traps. If selectors are ever rewritten here, expect
+   them again.
+
+
+--------------------------------------------------------------------------------
+9. OPEN ITEMS CARRIED OUT OF PHASE 1
+--------------------------------------------------------------------------------
+
+BLOCKING A DECISION (needs the team, not the code):
+  A6  "How do I download my capital gains statement?" is NOT answerable from
+      these 5 pages. Verified absent: 0 hits for "how to download" /
+      "download your" / "tax statement" across all 5 raw pages. The only
+      "capital gains" string on any page is inside a modal about exit-load
+      TAXATION, not about downloading.
+      Options: (1) add a Groww help-centre URL to data/sources.md, (2) add
+      the registrar/CAMS statement page, (3) drop the question and demo the
+      "not in my sources" refusal instead.
+      RECOMMENDATION: option 3 for the class demo. It is honest, and the
+      refusal path is itself a graded feature.
+      Tracked as open decision A6 in docs/architecture.md section 12.
+
+CLOSED:
+  A1  Chunk params resolved: 200 target / 240 hard cap / 25 overlap. Forced
+      by the fact that all-MiniLM-L6-v2 truncates at 256 wordpiece tokens --
+      the originally specified 300-600 would silently lose the chunk tail at
+      embedding time. Applied to PRD section 6.2 and architecture section 5.3.
+  A5  Factsheet fallback NOT needed. The __NEXT_DATA__ payload supplies every
+      field exactly, so the PRD section 11 risk about client-rendered fee
+      tables is retired.
+
+STILL OPEN (later phases):
+  A2  MIN_SIMILARITY - tune in Phase 3 against the 7 positive / 5 negative
+      question set. NOTE: the corpus is small (55 blocks), so there is less
+      margin between a good and a bad hit. This tuning matters MORE than
+      originally planned.
+  A3  EDU_LINK for the advice refusal (SEBI charter vs HDFC education).
+  A4  Commit chroma_db/ or require `cli ingest` before the demo.
+
+ENVIRONMENT:
+  .venv created. Installed so far: requests, beautifulsoup4, python-dotenv,
+  pytest. NOT yet installed: sentence-transformers, chromadb, anthropic,
+  streamlit (needed from Phase 2 onward; ~2GB with torch).
+
+
+--------------------------------------------------------------------------------
+10. HOW TO RE-RUN AND VERIFY
+--------------------------------------------------------------------------------
+
+  source .venv/bin/activate
+
+  python -m src.cli ingest --refresh   # re-fetch from network
+  python -m src.cli ingest             # rebuild from cache (offline)
+  python -m src.cli inspect            # dump manifest + coverage
+  pytest -q                            # 32 tests, no network, no API key
+
+  Useful one-liner to eyeball the corpus:
+  python -c "import json; d=json.load(open('data/documents/elss.json')); \
+  [print(b['kind'], '|', b['section'], '|', b['text'][:70]) for b in d['blocks']]"
+
+  Fast pre-commit gate (no key, no index):
+  pytest -m "not llm and not integration"
+
+
+--------------------------------------------------------------------------------
+11. GIT STATE
+--------------------------------------------------------------------------------
+
+NOT COMMITTED. Everything is untracked or modified:
+  R  problemstatement.txt -> docs/Problemstatement.txt
+  ?? .env.example  .gitignore  README.md  requirements.txt
+  ?? data/  docs/  src/  tests/
+
+  cache/ and chroma_db/ are gitignored, so they will not be committed.
+  data/documents/ (24K) and data/index_manifest.json (8K) are currently
+  untracked but NOT ignored. Recommendation: commit them as a small,
+  reviewable audit trail of what was extracted -- useful in the demo to show
+  the corpus without a network round trip.
+
+  Suggested commit message (Phase 0 + 1 together):
+    "Add ingestion pipeline: source parsing, cached fetcher, structured
+     __NEXT_DATA__ facts, DOM-aware extractor, and 32 tests"
+
+================================================================================
+END OF INTERNAL REFERENCE
+================================================================================

@@ -1,0 +1,313 @@
+================================================================================
+INTERNAL REFERENCE ONLY -- NOT A DELIVERABLE, NOT FOR SUBMISSION.
+Not part of the PRD, architecture, or demo. This is a build log for the team:
+what exists after Phase 5, which file does what, what was actually verified,
+and what is still open.
+================================================================================
+
+
+PHASE 5 -- STREAMLIT UI
+Status: BUILT AND VERIFIED OFFLINE. ONE ACCEPTANCE CRITERION (A1) NOT MET.
+Verified: A9 passes (disclaimer visible on first render, asserted) |
+          3/3 example chips send their question and get a reply |
+          debug panel renders real hits with cosine scores |
+          15 new UI tests, all passing | app raises no exception on any path
+Blocked: A1 needs a live answer, which needs ANTHROPIC_API_KEY (see section 11)
+================================================================================
+
+
+1. HEADLINE: "THE SERVER STARTED" IS NOT VERIFICATION
+
+  The first check run was `streamlit run src/app.py` plus a curl for HTTP 200.
+  It passed and proved almost nothing: Streamlit serves a static HTML shell
+  regardless of whether the script works, and the script only executes when a
+  browser session connects. A 200 here is compatible with a completely broken
+  app.
+
+  Verification therefore used streamlit.testing.v1.AppTest, which runs the real
+  script in-process and exposes the rendered element tree. That is what made
+  the three bugs in section 2 findable at all -- every one of them produced a
+  page that started fine and rendered wrong.
+
+
+2. THREE BUGS, NONE VISIBLE FROM A SERVER-HEALTH CHECK
+
+  2.1  THE SIDEBAR NEVER RENDERED ON THE NORMAL PATH
+
+    _render_sidebar() was called only inside the `if not index_ready:` branch,
+    on the reasonable reading that an empty index means there is nothing to
+    describe. So with a healthy index -- the state the demo actually runs in --
+    the sidebar was absent: no corpus scope, no settings, no Clear chat, no
+    second copy of the disclaimer.
+
+    The server was healthy throughout. The page was missing half its content.
+
+    Fixed by rendering the sidebar first, unconditionally, and keeping the early
+    return for the empty-index case.
+
+  2.2  st.text() TAKES ONE ARGUMENT, AND THIS RAISED ON EVERY RENDER
+
+        st.text("Last indexed", ingested_at)     ->  TypeError
+
+    with a 3-positional-arg signature. Every render of the sidebar raised, so the
+    page showed an error instead of the app. Caught immediately by
+    test_page_renders_with_no_exception once the sidebar was actually reached.
+
+    Fixed with f-strings. This is the sort of thing a "does it start" check
+    misses completely.
+
+  2.3  `streamlit run` DOES NOT PUT THE PROJECT ROOT ON sys.path
+
+    The app died on import with `ModuleNotFoundError: No module named 'src'`.
+    `streamlit run src/app.py` puts src/ on the path, not the repo root, so
+    `from src.config import CONFIG` cannot resolve. The CLI never hit this
+    because `python -m src.cli` already places the root on the path.
+
+    Fixed with an explicit PROJECT_ROOT sys.path insert at the top of app.py,
+    before the src imports, with a comment saying why the CLI does not need it.
+
+  A fourth, smaller one: tests/test_app.py resolved "src/app.py" relative to the
+  process cwd, which pytest does not guarantee to be the repo root. Every test
+  errored with FileNotFoundError until the path was anchored to the test file.
+
+
+3. src/app.py                          235 lines  (NEW)
+
+  Renders and calls. Zero business logic, which is the spec's hard constraint
+  and the one that decays fastest as a project grows: every decision about what
+  may reach the model lives in chain.py, every refusal string in prompts.py.
+
+  Layout, in the order implementation.md 4 specifies:
+
+    1  set_page_config(centered, page_title="HDFC MF Facts Assistant")
+    2  welcome line, "5 schemes, public pages only"
+    3  DISCLAIMER -- imported from prompts, never retyped -- in THREE places
+    4  3 example chips, wired to send
+    5  chat via st.session_state["messages"]
+    6  st.expander("Retrieved chunks (debug)")
+    7  sidebar: corpus, settings, Clear chat
+    8  empty-index guard
+
+  The disclaimer is imported, not retyped, so it cannot drift from the constant
+  the tests assert on. A9 depends on that.
+
+  Caching: chain.py memoises the Retriever and Generator in module globals, and
+  AppTest plus a single dev server both exercise that, so the
+  SentenceTransformer loads once per process rather than per keystroke. The
+  first load takes a few seconds and is the only noticeable delay.
+
+
+4. THE EMPTY-INDEX GUARD (A-RELEVANT, AND EASY TO GET WRONG)
+
+  The spec asks for a guard showing "Run: python -m src.cli ingest" instead of a
+  broken chat box. Two details matter:
+
+  - It must not import sentence_transformers just to decide. Calling
+    Retriever() to check would load the whole model on a page that is about to
+    tell the user to go and build an index. It calls open_collection().count()
+    and swallows any exception, which treats an unreadable store as "not ready"
+    -- the right default, because the recovery instruction is the same.
+
+  - The sidebar still renders on this path. Someone who has not ingested yet
+    still benefits from knowing what the corpus is meant to contain. This was
+    the direct cause of bug 2.1.
+
+  NOTE THE INVERSION: this project ships with a built index, so the normal path
+  is the one that matters for the demo. A guard that only works when the index
+  is missing is not a guard.
+
+
+5. WHY CHIPS USE A pending SLOT INSTEAD OF SENDING DIRECTLY
+
+  A naive chip handler appends the question and renders the answer in the same
+  run. If anything triggers a rerun before the assistant turn is drawn --
+  and a button click is a rerun -- the question is appended twice and answered
+  twice, so the transcript shows a duplicate.
+
+  The pattern used here:
+
+      chip click -> st.session_state["pending"] = question; st.rerun()
+      next run   -> question = pop("pending") or chat_input value
+                    pop, not get: it must be consumed exactly once
+
+  Tested for all three chips: test_each_example_button_sends_its_question is
+  parametrised over indices 0, 1, 2 and asserts exactly two chat messages, one
+  user and one assistant. A duplicate would make it three.
+
+
+6. src/app.py CALLS chain.answer() AND RENDERS. NOTHING ELSE.
+
+  Verified by inspection rather than assertion, since it is a design rule rather
+  than a behaviour: the only business entry point in the file is
+
+      def _get_answered(question):
+          from src.rag.chain import answer
+          return answer(question)
+
+  and it is called in exactly one place. There is no `if "expense ratio" in
+  question` anywhere in app.py, which is the failure mode the spec warns about.
+
+  The retrieval-gate constants are displayed but never re-implemented:
+  MIN_SIMILARITY and MIN_LEXICAL_COVERAGE are read from CONFIG, so the sidebar
+  cannot quote a number the retriever is not actually using.
+
+
+7. THE DEBUG PANEL, WHICH IS THE POINT OF THE WHOLE PHASE
+
+  "The single most valuable thing to show in a demo: it makes retrieval
+  visible." Per hit: rank, score, scheme, section, raw unprefixed text, and the
+  source URL.
+
+  Note it shows `hit.chunk.text` -- the unprefixed text. The scheme and section
+  prefix exists only in embedding_text(), so what the panel shows is precisely
+  what a human can go and verify on the page. Showing the prefixed form would
+  misrepresent what was stored.
+
+  Rendering is gated on result.hits being non-empty, so a refusal that happened
+  before retrieval shows no panel rather than an empty one, while a refusal
+  AFTER retrieval (a generation failure) still shows the chunks that were read.
+  That second case is why Answer.hits is populated on refusals, and it is what
+  makes a no-key run debuggable rather than opaque.
+
+  Verified live offline: 4 chunks, scores, and all 4 groww.in URLs rendered.
+
+
+8. A HONEST LIMITATION OF THE VERIFICATION
+
+  Everything in this document was verified WITHOUT a working answer layer,
+  because no ANTHROPIC_API_KEY is available. So what was actually exercised is:
+
+    - the guard refusals, which need no API call
+    - the no-match refusal, which needs no API call
+    - the retrieval + debug panel, up to the point of generation
+    - every rendering path, layout, sidebar, expander, clear chat
+
+  What was NOT exercised is a single generated answer rendered in the UI: no
+  citation link, no <=3-sentence answer, no A2-style number, and no
+  determinism check through the UI. Those are all covered by
+  tests/test_acceptance.py, which is where the key is needed.
+
+  Concretely, in every verified run the assistant bubble read "I couldn't find
+  that on the HDFC source pages I have" -- because generation failed without a
+  key, and chain.answer() correctly fell back to NO_MATCH. That is the
+  no-traceback fallback working, but it is not a demonstration of the answer
+  path. Anyone reading the transcripts of these runs should not mistake it for
+  the retrieval gate refusing; the guard log says which it was.
+
+
+9. tests/test_app.py                    165 lines, 15 tests  (NEW)
+
+  Beyond the spec, for the same reason as Phase 4's test_chain.py: the phase's
+  exit criteria are about what a user SEES, and nothing else in the suite can
+  observe that.
+
+  Covered:
+    A9 disclaimer in main + sidebar + footer
+    welcome line present
+    3 chips exist and match the PRD set
+    each chip sends exactly one question and gets one reply (parametrised x3)
+    sidebar lists all 5 corpus links, read from data/sources.md at runtime
+    sidebar shows embed model, TOP_K, both thresholds, ingested_at
+    Clear chat exists
+    debug expander renders scores and the right scheme
+    assistant turn shows "Last updated from sources"
+    out-of-corpus chip refuses
+    no Traceback or raw error text anywhere in the rendered page
+
+  Marked integration, since they need the built index and the model.
+
+      $ pytest tests/test_app.py -q
+      15 passed in 11.31s
+
+
+10. README.md USAGE SECTION
+
+  Filled in with the real commands, verified to run:
+
+      python -m src.cli ingest
+      streamlit run src/app.py
+      python -m src.cli ask "expense ratio of HDFC Large Cap Fund?"
+      python -m src.cli ask --explain "exit load on HDFC Flexi Cap Fund"
+      python -m src.cli ask --retrieve-only "minimum SIP amount"
+      python -m src.cli inspect
+
+  Plus a 5-step demo script and a settings table carrying the actual tuned
+  values, including the -0.116 cosine gap so the two gates are explained rather
+  than just asserted.
+
+  "Sample Q&A" and "Known limits" are left as Phase 6 placeholders, per spec.
+
+
+11. EXIT CRITERIA STATUS, HONESTLY
+
+  implementation.md Phase 5: "A1 and A9 pass; all three example buttons work; a
+  debug panel shows scores."
+
+      A1  pipeline end-to-end from a clean clone    NOT MET
+          ingest populates ChromaDB (works), but "chat answers" needs a key.
+      A9  disclaimer visible on first render        PASS, asserted by test
+      example buttons work (3/3)                   PASS, asserted by test
+      debug panel shows scores                     PASS, asserted by test
+
+  So 3 of 4 criteria are verified, and the one that is not is the same blocker
+  as Phase 4's. Nothing about the UI is waiting on anything except the key.
+
+
+12. WHAT A REVIEWER SHOULD CHECK BY HAND
+
+  The automated tests assert on the element tree, not on pixels. These still
+  need eyes on a real browser:
+
+    - the disclaimer is legible without scrolling at a normal window height
+    - the debug expander is collapsed by default and does not dominate the page
+    - the 3 chips fit on one line, and wrap sensibly on a narrow window
+    - the first load is not so slow that the audience assumes it is broken
+      (the model loads once; a few seconds)
+    - the sidebar does not feel cluttered
+
+
+13. SUITE TOTALS AFTER PHASE 5
+
+      pytest -q                             204 passed, 18 skipped
+      pytest -q -m "not llm and not integration"   166 passed, 56 deselected
+      pytest -q -m integration                    38 passed, 1 skipped
+
+  The 18 skips are unchanged from Phase 4: 17 llm acceptance tests plus the
+  pre-existing A6 statement-download test. Phase 5 added 15 passing tests and no
+  new skips.
+
+  Installed: streamlit 1.64.0. requirements.txt already listed streamlit>=1.38,
+  so no change was needed.
+
+
+14. STILL OPEN, CARRIED FORWARD
+
+  Unchanged by this phase:
+
+  - ANTHROPIC_API_KEY absent, so Phase 4's A2-A6/A10 and Phase 5's A1 are
+    unverified. One key closes both phases.
+  - src/rag/retriever.py:130 `augment: bool = True` contradicts
+    docs/architecture.md:555 and the Phase 3 reference, which both say
+    augmentation is off by default.
+  - MIN_SIMILARITY=0.30 / MIN_LEXICAL_COVERAGE=0.55 still unconfirmed by the
+    team and unwritten to .env. The UI sidebar displays these values, so they
+    are already on screen during the demo regardless.
+  - A7: PRD 6.3 still specifies a single similarity threshold.
+
+
+15. GIT STATE
+
+  NOT COMMITTED. Everything is untracked from Phase 0 onward, so git cannot
+  distinguish this phase's files and `git diff` shows nothing. Phase 5 files:
+
+    NEW  src/app.py
+         tests/test_app.py
+         docs/Phase4_internal_reference.txt
+         docs/Phase5_internal_reference.txt
+
+  Changed in Phase 5:
+
+    README.md      Usage, demo script, and settings table filled in
+
+  No change to requirements.txt (streamlit>=1.38 was already listed).
+================================================================================
