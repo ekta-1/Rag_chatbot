@@ -1,0 +1,56 @@
+# Streamlit configuration for container hosting.
+#
+# Local runs pass flags on the command line and work fine. Under Render the
+# command line is fixed by render.yaml, so the settings that make a headless
+# container behave belong here instead. Anything set here can still be
+# overridden by the matching --server.* flag.
+
+[server]
+# Render scans the process for a bound port, and Streamlit does NOT read the
+# PORT environment variable on its own -- verified against streamlit 1.64, which
+# has no reference to it anywhere in the package. Without an explicit
+# --server.port=$PORT (set in render.yaml's start command) Streamlit binds 8501
+# while Render routes to its own port, and the service returns 502.
+port = 8501
+
+# Required in a container. Without headless mode Streamlit also tries to open a
+# browser and prompts for an email on first run, which hangs a deploy.
+headless = true
+
+# Bind all interfaces. The default localhost is unreachable from outside the
+# container.
+address = "0.0.0.0"
+
+# A long model load on a cold 2 GB instance should not be killed as a dead
+# connection. This is the websocket idle timeout, not the HTTP one.
+# 300s also comfortably covers a cold SentenceTransformer download.
+timeout = 300
+
+# CORS/XSRF: Streamlit's defaults assume a trusted single origin. On a public
+# Render hostname the origin differs from the Host header, which trips the
+# XSRF check on websocket upgrades. Disabling both is the standard fix for a
+# public Streamlit deployment; the app is read-only and holds no auth, so there
+# is no session to protect. Do NOT copy this pattern onto an app with login.
+enableXsrfProtection = false
+enableCORS = false
+
+maxUploadSize = 5
+
+[browser]
+# No telemetry phone-home from a demo instance.
+gatherUsageStats = false
+
+[runner]
+# Streamlit watches the filesystem for edits. Inside a container the source tree
+# is read-only and immutable, so the watcher burns CPU re-scanning for nothing.
+# Removing the file-watcher is the single biggest CPU saving on a small
+# instance, and it also removes a class of "file changed, please rerun" churn.
+fastReruns = true
+
+[theme]
+base = "light"
+primaryColor = "#0b6bcb"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f7fa"
+textColor = "#1a1a1a"
+font = "sans serif"

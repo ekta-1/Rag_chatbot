@@ -1,0 +1,100 @@
+# Render blueprint. Applying this file to the repo provisions the service with
+# the right build/start commands, health check and instance size in one step,
+# instead of typing each into the dashboard.
+#
+#     Dashboard -> New -> Blueprint -> point at this repo
+#
+# Two settings are NOT in here and must be added by hand, because Render refuses
+# to let a blueprint hold a secret it did not create:
+#
+#   GROQ_API_KEY   your key from https://console.groq.com/keys
+#   GROQ_MODEL     run `python scripts/list_models.py` locally to see what your
+#                  key can actually reach; do not trust the default, an
+#                  unreachable model fails at the API with a 404 that looks
+#                  like a key problem
+#
+# Do not set GROQ_API_KEY in a committed .env. .env is git-ignored here, but the
+# only safe place for a key is Render's dashboard.
+
+services:
+  - type: web
+    name: rag-chatbot
+    runtime: python
+    plan: standard # 2 GB RAM -- see the note below, this is not optional
+    language: python
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: >-
+      python scripts/ensure_index.py
+      && streamlit run src/app.py
+      --server.port=$PORT
+      --server.address=0.0.0.0
+      --server.headless=true
+      --browser.gatherUsageStats=false
+    healthCheckPath: /_stcore/health
+    # region: singapore  # uncomment and pick the region nearest your audience;
+    #                        left unset so Render uses its default (Oregon)
+    # Streamlit loads a SentenceTransformer on first use; the default 5s probe
+    # would fail the deploy and restart-loop a 2 GB instance through a slow
+    # model download. 100s is comfortably above a cold load.
+    healthCheckTimeout: 100
+    envVars:
+      # Python version is pinned by .python-version at the repo root, not here.
+      # Render's PYTHON_VERSION variable must be fully qualified, and pinning an
+      # exact patch risks naming a version its build image does not carry.
+      # ".python-version: 3.14" resolves to the newest 3.14.x on every deploy,
+      # which matches the 3.14.7 this was last tested on.
+      - key: LLM_PROVIDER
+        value: groq
+      # Left as sync: false on purpose. Flip it only if the dashboard warns
+      # about a secret being in blueprint YAML.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: qwen/qwen3.8-27b
+      - key: GROQ_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: EMBED_MODEL
+        value: sentence-transformers/all-MiniLM-L6-v2
+      - key: TOP_K
+        value: "4"
+      - key: MIN_SIMILARITY
+        value: "0.30"
+      - key: MIN_LEXICAL_COVERAGE
+        value: "0.55"
+      # Keep the tokenizers quiet and the logs readable; these libraries log a
+      # HEAD request per file on first load, which buries real errors.
+      - key: HF_HUB_DISABLE_TELEMETRY
+        value: "1"
+      - key: TOKENIZERS_PARALLELISM
+        value: "false"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+# Why `plan: standard` and not the free tier.
+#
+# Measured on this codebase, resident memory as the app answers a question:
+#
+#     bare python                 15 MB
+#     + streamlit                 51 MB
+#     + chromadb (26 chunks)     122 MB
+#     + all-MiniLM-L6-v2         600 MB   <-- torch runtime, the whole cost
+#
+# 600 MB does not fit Render's Free (512 MB) or Starter (512 MB, $7) instance.
+# Both will be OOM-killed mid-request, which presents as a blank page or a 502
+# rather than a clear error. Standard is 2 GB for $25/month and leaves room for
+# the model plus request concurrency.
+#
+# The free tier is also a poor demo fit even if it fit in memory: it spins down
+# after 15 minutes idle and takes about a minute to come back, and the app needs
+# roughly 3 questions/minute against Groq's 8000 tokens/min cap. A cold start
+# plus a rate-limit 429 is a bad first impression in a 3-minute demo.
+#
+# To try the free tier anyway: set plan to `free` and expect it to fail. If you
+# want it to fit, the lever is the embedding model, not the instance -- swapping
+# all-MiniLM-L6-v2 for something smaller means re-tuning MIN_SIMILARITY and
+# MIN_LEXICAL_COVERAGE, because those thresholds were measured against it.
+#
+# A persistent disk is deliberately NOT configured. It is paid-only, it forces
+# zero-downtime deploys off, and it is unnecessary: the corpus is 5 pages, and
+# scripts/ensure_index.py rebuilds the index in seconds when the ephemeral
+# filesystem is empty.

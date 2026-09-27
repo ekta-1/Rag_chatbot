@@ -128,6 +128,73 @@ Tuned on this corpus and documented in `docs/architecture.md` §5.6:
 unanswerable "HDFC Bank's FD interest rate?" scores `0.561`, above the answerable
 "minimum SIP amount" at `0.445`.
 
+## Deploying to Render
+
+`render.yaml` is a Render blueprint, so the whole service is one click:
+
+1. Push the repo (done) and in Render choose **New → Blueprint**.
+2. Point it at this repository. Render reads `render.yaml`.
+3. Fill in the one secret it deliberately leaves blank:
+   `GROQ_API_KEY` — from <https://console.groq.com/keys>.
+4. Set `GROQ_MODEL` to a model your key can actually reach. Run
+   `.venv/bin/python scripts/list_models.py` locally first; the default in the
+   blueprint is a placeholder and an unreachable model fails at the API with a
+   404 that reads like a key problem.
+5. Deploy. First build is slow (~10 min) because `torch` is ~800 MB.
+
+Or set it up by hand in the dashboard — the values that matter:
+
+| Field | Value |
+|---|---|
+| Runtime | Python |
+| Build command | `pip install --upgrade pip && pip install -r requirements.txt` |
+| Start command | `python scripts/ensure_index.py && streamlit run src/app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true --browser.gatherUsageStats=false` |
+| Health check path | `/_stcore/health` |
+| Instance type | **Standard (2 GB)** — see below |
+| Python version | from `.python-version` (`3.14`) |
+
+### Four things that will bite you
+
+**1. Instance size is not optional.** Measured on this codebase:
+
+| Loaded | Resident |
+|---|---|
+| bare Python | 15 MB |
+| + streamlit | 51 MB |
+| + chromadb (26 chunks) | 122 MB |
+| + all-MiniLM-L6-v2 | **600 MB** |
+
+600 MB does not fit Free (512 MB) or Starter (512 MB, $7/mo) — both get
+OOM-killed mid-request, which shows up as a blank page or a 502 rather than a
+useful error. **Standard, 2 GB, $25/mo** is the floor that works. If you need it
+cheaper the lever is the embedding model, not the instance, and swapping it means
+re-tuning `MIN_SIMILARITY` and `MIN_LEXICAL_COVERAGE`, because those numbers were
+measured against all-MiniLM.
+
+**2. Streamlit does not read the `PORT` env var.** Verified against streamlit
+1.64 — no reference to it in the package. Render sets `PORT` and routes to it, so
+the start command must pass `--server.port=$PORT` explicitly. Omit it and you get
+a 502 with a healthy-looking log.
+
+**3. The filesystem is ephemeral.** `chroma_db/` is gone after a redeploy or a
+restart. That is why the start command runs `scripts/ensure_index.py`, which
+builds the index only when it is missing — a warm start costs under a second
+instead of re-fetching five pages. A persistent disk is unnecessary (5 pages) and
+is paid-only; it also disables zero-downtime deploys.
+
+**4. The free tier is a bad demo target even ignoring memory.** It spins down
+after 15 minutes idle and needs ~1 minute to wake, while the app can only serve
+about 3 questions/minute against Groq's 8000 tokens/min cap. A cold start
+landing on a rate-limited request is a poor first impression.
+
+### Paths are CWD-independent by design
+
+Every path in `src/config.py` is anchored to `PROJECT_ROOT`. This is load-bearing
+for deployment: a relative `CHROMA_DIR=./chroma_db` resolves against the process
+working directory, which under Render is not the repo root — the index gets
+written where the app never looks and the UI reports "index not built" forever.
+`tests/test_paths.py` changes CWD to keep that from coming back.
+
 ## Sample Q&A
 
 See [data/sample_qa.md](data/sample_qa.md) — 5 rows (3 factual, 1 advice refusal, 1

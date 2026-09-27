@@ -68,7 +68,14 @@ class Config:
     llm_model: str = "llama-3.3-70b-versatile"
 
     # -- Vector store (Phase 2) --------------------------------------------
-    chroma_dir: str = "./chroma_db"
+    # Anchored to PROJECT_ROOT, not CWD-relative. Every other path here is
+    # PROJECT_ROOT-anchored, and this one exception was a deployment bug waiting
+    # to happen: under Render the process CWD is not the repo root, so a bare
+    # "./chroma_db" would silently build the index somewhere the app never
+    # looks, and the UI would show "index not built" forever. Locally CWD
+    # happens to equal PROJECT_ROOT, which is exactly why the tests never caught
+    # it.
+    chroma_dir: str = str(PROJECT_ROOT / "chroma_db")
     collection_name: str = "hdfc_mf_faq"
 
     # -- Embedding (Phase 2) ----------------------------------------------
@@ -165,7 +172,7 @@ def _load() -> Config:
         groq_base_url=_env_str("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
         anthropic_api_key=_env_str("ANTHROPIC_API_KEY", ""),
         llm_model=_resolve_model(),
-        chroma_dir=_env_str("CHROMA_DIR", "./chroma_db"),
+        chroma_dir=_env_str("CHROMA_DIR", str(PROJECT_ROOT / "chroma_db")),
         collection_name=_env_str("COLLECTION_NAME", "hdfc_mf_faq"),
         embed_model=_env_str("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
         top_k=_env_int("TOP_K", 4),
