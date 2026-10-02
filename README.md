@@ -258,3 +258,6 @@ question with a legitimate multi-part answer gets a partial answer, not a caveat
 link to SEBI's investor charter. This is a pre-filter, not a prompt instruction, so it holds even
 if the model is unhelpful.
 
+
+Hosted on Render, app is live with below URL:
+https://rag-chatbot-0jys.onrender.com/
