@@ -22,7 +22,25 @@ services:
     runtime: python
     plan: standard # 2 GB RAM -- see the note below, this is not optional
     language: python
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    # The index is built here, during the build, so the corpus is compiled before
+    # the service ever serves traffic and the runtime start is instant.
+    #
+    # ensure_index.py runs in BOTH phases on purpose. It is idempotent: it exits
+    # immediately if chroma_db is already populated, so the build-time run does the
+    # real work and the start-time run is a sub-second no-op that costs nothing. It
+    # is kept in startCommand because whether build-phase filesystem writes survive
+    # into the runtime instance is not something this repo can guarantee -- if they
+    # do not, the start-time call is what saves the deploy from booting with an
+    # empty index and serving "index not built" forever.
+    buildCommand: >-
+      pip install --upgrade pip
+      && pip install -r requirements.txt
+      && python scripts/ensure_index.py
+    #
+    # No `cd` here. Render clones this repo to /opt/render/project/src, so that
+    # path IS the repo root and relative paths already resolve correctly.
+    # /opt/render/project is the PARENT of the repo; prefixing a cd to it walks
+    # out of the checkout and every path then fails to resolve.
     startCommand: >-
       python scripts/ensure_index.py
       && streamlit run src/app.py
@@ -98,3 +116,13 @@ services:
 # zero-downtime deploys off, and it is unnecessary: the corpus is 5 pages, and
 # scripts/ensure_index.py rebuilds the index in seconds when the ephemeral
 # filesystem is empty.
+#
+# Note on the two working directories, which cost two failed deploys to pin down:
+# the BUILD phase and the RUNTIME phase do not share a working directory on
+# Render's non-Docker Python runtime. The build phase runs from the repo root, so
+# `pip install -r requirements.txt` resolves there. The runtime runs from
+# WORKDIR, which for this runtime is /opt/render/project/src -- and that is also
+# where Render clones the repo, so relative paths work in both. What does NOT work
+# is a `cd /opt/render/project` in either command: that is the parent of the
+# checkout, not the repo root, and it turns "file not found" into a confusing
+# off-by-one-directory error. Leave Root Directory blank.
